@@ -41,6 +41,8 @@ structuring         74    53         46 of 46     0.62 -> 0.87
 pass_through        88    47         43 of 44     0.50 -> 0.92
 fan_in             245    57         41 of 41     0.17 -> 0.72
 all                407   157        130 of 131    61% fewer alerts
+
+Streamed the same datasets through the live path: 407 of 407 alerts got exactly the features the offline numbers above were computed from
 ```
 
 …followed by a SAR draft for a structuring alert, and the same draft with one deposit amount nudged by
@@ -119,6 +121,50 @@ model never saw. Fit on 11-15, margin from 16-20, report on the demo's seeds.
 - Of the 27 false positives it keeps, 23 are on customers known for under a week; the other 4 are home
   purchases.
 
+## Triage in the stream (v0.3)
+
+The v0.2 numbers come from an offline evaluation. A bank can't use a model that only works offline: it
+runs on alerts as they fire, and every alert it hides has to be explainable later. v0.3 runs triage
+live, as part of ingestion in the API.
+
+**Same features live as offline.** The offline evaluation builds an index of the whole dataset,
+future included, and queries it as of each alert. Live, there is only what has arrived so far. If a
+feature quietly read even one transaction past the alert, the offline numbers would be better than
+anything the stream could reproduce. `online_parity()` streams every demo dataset through the live
+path and compares features alert by alert: 407 of 407 identical. A test also plants a feature that
+looks one day ahead and checks that the parity check catches it.
+
+**Every decision is a record.** Each alert gets a triage decision when it fires, stored next to it (features rounded here):
+
+```json
+{
+  "model_version": "triage-2da74865b6e0",
+  "queued": false,
+  "score": 0.0938,
+  "threshold": 0.1847,
+  "reason": "suppressed: score 0.094 < threshold 0.185; biggest push down: days_to_first_out",
+  "features": {"out_legs": 1.0, "dest_paid_by_other_customers": 0.0,
+               "days_to_first_out": 1.391, "out_ratio": 0.922},
+  "contributions": {"days_to_first_out": -1.863, "out_legs": -1.262,
+                    "out_ratio": -0.823, "dest_paid_by_other_customers": 1.117}
+}
+```
+
+That one is a home purchase: a single wire out, 1.4 days after the money arrived. The model version is
+a hash of the model's parameters, so a version names exactly one model. `Triage.replay(decision)`
+recomputes the score from the logged inputs, and refuses if the decision came from a different
+version. A model file whose feature list doesn't match what the code computes is refused at load.
+
+**The shipped model is reproducible.** `amlwatch/triage_model.json` is what `python -m amlwatch.train`
+writes (fit on seeds 11-15, margin from 16-20), and a test retrains it and compares, so a stale
+model file fails CI.
+
+**Suppressed alerts are sampled, not deleted.** In production there's no ground truth to score
+against, so the only way to learn what triage hides is to have people review a random sample of what
+it suppressed ("below-the-line" testing). `GET /suppressed/sample?n=&seed=` draws one, reproducibly.
+The sample size matters: on the demo seeds triage hid 250 alerts, one of them real, so a 10% sample has
+about a 1 in 10 chance of finding it. How much to sample is a risk decision, not an engineering one.
+
 ## The narrative contract
 
 A draft is `ready` only if `validate()` passes every sentence:
@@ -146,14 +192,17 @@ uvicorn amlwatch.api:app --port 8000   # seeds the synthetic dataset on startup
 | Endpoint | |
 | --- | --- |
 | `POST /transactions` | Ingest a batch in timestamp order; returns any alerts it completes. Out-of-order → 422, duplicate id → 409 |
-| `GET /alerts?typology=` | List alerts |
-| `GET /alerts/{id}` | Alert with its evidence table |
+| `GET /queue?limit=` | The investigator queue: alerts triage kept, highest score first |
+| `GET /alerts?typology=&status=queued\|suppressed` | All alerts, each with its triage decision |
+| `GET /alerts/{id}` | Alert with its triage decision and evidence table |
+| `GET /suppressed/sample?n=&seed=` | Reproducible random sample of suppressed alerts, for below-the-line review |
 | `POST /alerts/{id}/narrative?drafter=template\|claude` | Draft and validate a SAR narrative |
-| `GET /metrics` | Transaction and alert counts |
+| `GET /metrics` | Transaction, alert, queued and suppressed counts, and the triage model version |
 
 `drafter=claude` uses the official `anthropic` SDK with `ANTHROPIC_API_KEY`. The model defaults to
 `claude-opus-5-5` (override with `AMLWATCH_MODEL`), and server-side refusal fallback is enabled.
-Set `AMLWATCH_SEED_DEMO=0` to start with an empty monitor.
+Set `AMLWATCH_SEED_DEMO=0` to start with an empty monitor, and `AMLWATCH_TRIAGE_MODEL` to load a
+different model file.
 
 ## Tests
 
@@ -165,11 +214,15 @@ Rule edge cases (band and window boundaries, card spend, cooldown, out-of-order 
 test for paycheck dilution of the pass-through ratio, adversarial drafts (no citation, foreign
 citation, wrong amount, wrong date, right amount but wrong transaction), the Claude retry/review path
 against a fake client, the API, and triage (features never read counterparty names, reach only counts
-other customers and only the past, the threshold keeps every real training case, and a held-out run).
+other customers and only the past, the threshold keeps every real training case, a held-out run,
+live/offline feature parity, a planted look-ahead feature that parity must catch, decision replay,
+and the shipped model matching its training recipe).
 
 ## Roadmap
 
-- Triage in the API: score alerts on ingest and expose a ranked queue.
+- Investigator dispositions through the API, fed back as training labels (with care: they only exist
+  for alerts someone looked at).
+- Bounded state: the live history keeps every transaction; it only needs about 33 days per account.
 - Counterparty features beyond reach: registered-business flag, account age, linked accounts.
 - Kafka consumer in front of `Monitor.ingest` and durable alert storage (Postgres).
 - More typologies: round-dollar wires, dormant-account reactivation, rapid cross-border movement.

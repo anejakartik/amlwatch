@@ -1,7 +1,13 @@
 from dataclasses import replace
+from datetime import timedelta
 
-from amlwatch.evaluate import triage_report
+import pytest
+
+from amlwatch import evaluate as evaluate_mod
+from amlwatch import triage as triage_mod
+from amlwatch.evaluate import labelled_alerts, online_parity, train_triage, triage_report
 from amlwatch.models import PASS_THROUGH, STRUCTURING, Alert
+from amlwatch.train import MODEL_PATH
 from amlwatch.triage import History, LogReg, Triage, features
 
 
@@ -77,3 +83,55 @@ def test_triage_cuts_alerts_on_unseen_seeds():
     real_kept = sum(r["real_kept"] for r in report.values())
     assert kept < alerts * 0.6
     assert real_kept >= real - 1
+
+
+def test_live_features_match_the_offline_evaluation():
+    """Features computed as transactions stream in equal the ones the offline numbers came from."""
+    checked, mismatched = online_parity([7])
+    assert checked > 50 and mismatched == []
+
+
+def test_parity_check_catches_a_feature_that_reads_the_future(monkeypatch):
+    """The check has teeth: a feature that peeks a day past the alert fails it."""
+    real = triage_mod.features
+
+    def leaky(alert, hist):
+        x = real(alert, hist)
+        later = hist.account_between(alert.account_id, alert.detected_at, alert.detected_at + timedelta(days=1))
+        return [*x, len(later)]
+
+    monkeypatch.setattr(evaluate_mod, "features", leaky)
+    _, mismatched = online_parity([7])
+    assert mismatched
+
+
+def test_saved_model_scores_identically_and_replays_decisions(tmp_path):
+    triage, _ = triage_report([11, 12], [13], [7])
+    triage.save(tmp_path / "m.json")
+    loaded = Triage.load(tmp_path / "m.json")
+    assert loaded.version == triage.version
+
+    for a, h, _ in labelled_alerts([7])[:40]:
+        d = triage.decide(a, h)
+        assert loaded.decide(a, h) == d
+        assert loaded.replay(d) == d.score  # the logged inputs alone reproduce the score
+
+    other = Triage.from_dict({**triage.to_dict(), "margin": triage.margin + 0.05})
+    with pytest.raises(ValueError, match="decision was made by model"):
+        other.replay(d)
+
+
+def test_shipped_model_matches_its_training_recipe():
+    """amlwatch/triage_model.json must be what `python -m amlwatch.train` produces, not a stale copy."""
+    shipped, fresh = Triage.load(MODEL_PATH), train_triage()
+    assert shipped.margin == fresh.margin
+    for typ, m in fresh.models.items():
+        assert shipped.models[typ].w == pytest.approx(m.w, rel=1e-9)
+        assert shipped.base[typ] == pytest.approx(fresh.base[typ], rel=1e-9)
+
+
+def test_model_trained_on_other_features_is_refused():
+    d = Triage.load(MODEL_PATH).to_dict()
+    d["typologies"][PASS_THROUGH]["features"] = ["out_legs"]
+    with pytest.raises(ValueError, match="was trained on"):
+        Triage.from_dict(d)

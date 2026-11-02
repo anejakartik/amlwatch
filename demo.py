@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import argparse
 
-from amlwatch.evaluate import score, triage_report
+from amlwatch.evaluate import online_parity, score, triage_report
 from amlwatch.generator import generate
 from amlwatch.models import STRUCTURING, TYPOLOGIES
 from amlwatch.monitor import Monitor
@@ -53,6 +53,12 @@ def main() -> None:
     print(
         f"{'all':<14}{tot['alerts']:>8}{tot['kept']:>6}{tot['real_kept']:>11} of {tot['real']:<3}"
         f"{'':>4}{1 - tot['kept'] / tot['alerts']:.0%} fewer alerts"
+    )
+
+    checked, mismatched = online_parity(seeds)
+    print(
+        f"\nStreamed the same datasets through the live path: {checked - len(mismatched)} of {checked} alerts got "
+        "exactly the features the offline numbers above were computed from"
     )
 
     data = generate(seed=seeds[0])

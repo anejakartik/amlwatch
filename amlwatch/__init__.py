@@ -1,3 +1,3 @@
-"""amlwatch: streaming AML transaction monitoring with citation-checked SAR narrative drafts."""
+"""amlwatch: streaming AML transaction monitoring, alert triage, and citation-checked SAR narrative drafts."""
 
-__version__ = "0.1.0"
+__version__ = "0.3.0"

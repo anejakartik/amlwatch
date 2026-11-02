@@ -11,7 +11,10 @@ from __future__ import annotations
 from .generator import Dataset, generate
 from .models import TYPOLOGIES, Alert
 from .monitor import Monitor
-from .triage import Example, History, Triage
+from .triage import Example, History, Triage, features
+
+FIT_SEEDS = range(11, 16)
+VAL_SEEDS = range(16, 21)
 
 
 def score(alerts: list[Alert], data: Dataset) -> dict:
@@ -71,3 +74,32 @@ def triage_report(fit_seeds, val_seeds, test_seeds) -> tuple[Triage, dict]:
             "recall_after": round(real_kept / real, 3) if real else None,
         }
     return triage, out
+
+
+def train_triage() -> Triage:
+    """The shipped model: fitted on seeds 11-15, margin picked on 16-20. Never sees the demo seeds."""
+    return Triage().fit(labelled_alerts(FIT_SEEDS)).calibrate(labelled_alerts(VAL_SEEDS))
+
+
+def online_parity(seeds) -> tuple[int, list[str]]:
+    """Check the features computed live equal the ones the offline evaluation scored.
+
+    Offline, each alert's features come from a History holding the whole dataset,
+    future included, queried as of the alert. Live, there is only what has arrived so
+    far. If any feature quietly read the future, the two would differ and the offline
+    numbers would be better than anything the stream could reproduce.
+
+    Returns (alerts checked, ids of alerts whose features differ).
+    """
+    checked, mismatched = 0, []
+    for seed in seeds:
+        data = generate(seed=seed)
+        offline = History(data.transactions)
+        live, monitor = History(), Monitor()
+        for txn in data.transactions:
+            live.add(txn)
+            for a in monitor.ingest(txn):
+                checked += 1
+                if features(a, live) != features(a, offline):
+                    mismatched.append(f"seed {seed}: {a.alert_id}")
+    return checked, mismatched

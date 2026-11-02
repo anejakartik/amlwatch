@@ -43,3 +43,41 @@ def test_demo_data_is_seeded_on_startup(monkeypatch):
     with client() as c:
         m = c.get("/metrics").json()
         assert m["transactions"] > 10000 and m["alerts"] > 0
+
+
+def test_every_alert_gets_a_logged_triage_decision(monkeypatch):
+    monkeypatch.setenv("AMLWATCH_SEED_DEMO", "1")
+    with client() as c:
+        m = c.get("/metrics").json()
+        assert m["queued"] + m["suppressed"] == m["alerts"] and 0 < m["queued"] < m["alerts"]
+        assert m["triage_model"] == api.STATE.triage.version
+
+        queue = c.get("/queue?limit=500").json()
+        assert len(queue) == m["queued"]
+        scores = [a["triage"]["score"] for a in queue]
+        assert scores == sorted(scores, reverse=True)
+
+        hidden = c.get("/alerts?status=suppressed&limit=1000").json()
+        assert len(hidden) == m["suppressed"]
+        d = hidden[0]["triage"]
+        assert not d["queued"] and d["score"] < d["threshold"] and d["reason"].startswith("suppressed")
+        # contributions are listed most-negative first, and the reason names the first
+        assert list(d["contributions"].values()) == sorted(d["contributions"].values())
+        assert next(iter(d["contributions"])) in d["reason"]
+
+
+def test_below_the_line_sample_is_suppressed_and_reproducible(monkeypatch):
+    monkeypatch.setenv("AMLWATCH_SEED_DEMO", "1")
+    with client() as c:
+        a = c.get("/suppressed/sample?n=5&seed=3").json()
+        assert len(a) == 5 and not any(x["triage"]["queued"] for x in a)
+        assert [x["alert_id"] for x in a] == [x["alert_id"] for x in c.get("/suppressed/sample?n=5&seed=3").json()]
+
+
+def test_out_of_order_transaction_leaves_no_trace(monkeypatch):
+    monkeypatch.setenv("AMLWATCH_SEED_DEMO", "0")
+    with client() as c:
+        c.post("/transactions", json=[_txn(1, 12, 100)])
+        assert c.post("/transactions", json=[_txn(2, 8, 100)]).status_code == 422
+        assert "T0000002" not in api.STATE.txns
+        assert c.post("/transactions", json=[_txn(2, 13, 100)]).status_code == 200
