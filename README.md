@@ -34,6 +34,13 @@ structuring          46      70    1.00       0.66          24 of 24
 pass_through         44      88    1.00       0.50          44 of 44
 fan_in               41      86    1.00       0.48          45 of 45
 
+Triage on the same datasets, per alert (fitted on seeds 11-15, margin 0.15 from 16-20)
+
+typology        alerts  kept  real cases kept       precision
+structuring         74    53         46 of 46     0.62 -> 0.87
+pass_through        88    47         43 of 44     0.50 -> 0.92
+fan_in             245    57         41 of 41     0.17 -> 0.72
+all                407   157        130 of 131    61% fewer alerts
 ```
 
 …followed by a SAR draft for a structuring alert, and the same draft with one deposit amount nudged by
@@ -60,10 +67,57 @@ laundering patterns:
 
 A monitor tested only against clean negatives looks far better than it is. High recall with a heavy
 false-positive load is what rules-based transaction monitoring looks like in practice, and it's the
-problem v0.2 goes after (see the roadmap).
+problem triage goes after (below).
 
 The background population here is cleaner than real retail data, so treat the precision numbers as
 an upper bound for these rules, not a benchmark.
+
+## Triage (v0.2)
+
+The rules stay as they are, so they keep catching everything. Triage scores each alert and
+suppresses the ones that look like known-legitimate behavior. A suppressed alert is still logged; it
+just isn't put in front of an investigator.
+
+**Model.** One small logistic regression per typology (`amlwatch/triage.py`, pure Python), trained on
+alert outcomes. Here the generator's ground truth stands in for investigator dispositions.
+
+**Features: only what the bank has when the alert fires, and never a counterparty's name.**
+
+| Typology | Features |
+| --- | --- |
+| `structuring` | cash deposits in the 30 days before the pattern, deposits in the pattern, total vs. the CTR threshold |
+| `pass_through` | number of outbound legs, how many *other* customers had already paid the destination, days to the first outbound, out/in ratio |
+| `fan_in` | distinct senders in the 30 days before the burst, distinct senders in the burst, mean amount |
+
+The synthetic counterparties are named by kind (`TITLE01`, `BRK..`, `CUS..`), so a model allowed to
+read ids would learn the generator, not the behavior. A test renames every counterparty and checks
+the features don't change.
+
+**Threshold: recall first.** Each typology's threshold starts just under the lowest-scoring real case
+in training. That alone isn't enough: on new data a real case can score a little lower than anything
+the model was fitted on. So the margin below it is picked on a separate validation set (the smallest
+that keeps every real validation case), and the numbers above come from a third set of seeds the
+model never saw. Fit on 11-15, margin from 16-20, report on the demo's seeds.
+
+**What it gets right, and what it can't do.**
+
+- Precision is scored **per alert**, because that's the investigator's workload. Per alert, fan-in
+  precision before triage was 0.17, not the 0.48 per-account figure above, because a small
+  business re-alerts every week once the cooldown runs out.
+- **Every false positive it keeps on structuring and fan-in is a customer the bank had known for
+  less than a week.** The features ask "is this normal for this customer?", and for a brand-new
+  customer there's no answer. Every account in the synthetic data opens on day 0, so this
+  cold-start effect is exaggerated here, but it's real: new accounts are exactly where a bank knows
+  the least.
+- **It missed one real case out of 131.** The case was a pass-through with one outbound wire, sent 1.5 days
+  later to a destination no other customer had paid. With these features that's the same as a
+  home purchase through a title company nobody at the bank has used before. On these seeds, lowering the
+  threshold far enough to catch it would cost one extra false alert, but that's hindsight: a threshold
+  moved after looking at the test set makes the test result meaningless. The real fix is better
+  features, such as whether the destination is a registered business, which this synthetic data
+  doesn't have.
+- Of the 27 false positives it keeps, 23 are on customers known for under a week; the other 4 are home
+  purchases.
 
 ## The narrative contract
 
@@ -110,12 +164,13 @@ ruff check . && pytest
 Rule edge cases (band and window boundaries, card spend, cooldown, out-of-order input), a regression
 test for paycheck dilution of the pass-through ratio, adversarial drafts (no citation, foreign
 citation, wrong amount, wrong date, right amount but wrong transaction), the Claude retry/review path
-against a fake client, and the API.
+against a fake client, the API, and triage (features never read counterparty names, reach only counts
+other customers and only the past, the threshold keeps every real training case, and a held-out run).
 
 ## Roadmap
 
-- **v0.2: alert triage.** A model trained on alert outcomes to rank alerts and cut the look-alike
-  false positives, with recall held fixed and the trade-off reported.
+- Triage in the API: score alerts on ingest and expose a ranked queue.
+- Counterparty features beyond reach: registered-business flag, account age, linked accounts.
 - Kafka consumer in front of `Monitor.ingest` and durable alert storage (Postgres).
 - More typologies: round-dollar wires, dormant-account reactivation, rapid cross-border movement.
 - Case view UI: alert, evidence table and draft side by side, with validator flags inline.

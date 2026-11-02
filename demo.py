@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import argparse
 
-from amlwatch.evaluate import score
+from amlwatch.evaluate import score, triage_report
 from amlwatch.generator import generate
 from amlwatch.models import STRUCTURING, TYPOLOGIES
 from amlwatch.monitor import Monitor
@@ -39,6 +39,21 @@ def main() -> None:
             f"{typ:<14}{t['injected']:>9}{t['alerts']:>8}{t['tp'] / t['injected']:>8.2f}"
             f"{t['tp'] / t['alerts']:>11.2f}{t['lookalike_fp']:>12} of {fp}"
         )
+
+    # triage never sees the demo seeds: fitted on 11-15, margin picked on 16-20
+    triage, report = triage_report(range(11, 16), range(16, 21), seeds)
+    print(f"\nTriage on the same datasets, per alert (fitted on seeds 11-15, margin {triage.margin:.2f} from 16-20)\n")
+    print(f"{'typology':<14}{'alerts':>8}{'kept':>6}{'real cases kept':>17}{'precision':>16}")
+    tot = {"alerts": 0, "kept": 0, "real": 0, "real_kept": 0}
+    for typ, r in report.items():
+        for k in tot:
+            tot[k] += r[k]
+        precision = f"{r['precision_before']:.2f} -> {r['precision_after']:.2f}"
+        print(f"{typ:<14}{r['alerts']:>8}{r['kept']:>6}{r['real_kept']:>11} of {r['real']:<3}{precision:>16}")
+    print(
+        f"{'all':<14}{tot['alerts']:>8}{tot['kept']:>6}{tot['real_kept']:>11} of {tot['real']:<3}"
+        f"{'':>4}{1 - tot['kept'] / tot['alerts']:.0%} fewer alerts"
+    )
 
     data = generate(seed=seeds[0])
     txns = {t.txn_id: t for t in data.transactions}
