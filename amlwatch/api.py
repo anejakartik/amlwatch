@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import random
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
@@ -68,12 +68,26 @@ class TriageOut(BaseModel):
     contributions: dict[str, float]
 
 
+class DispositionIn(BaseModel):
+    outcome: str = Field(pattern="^(escalated|closed)$")
+    reviewer: str = Field(min_length=1)
+    note: str = ""
+
+
+class DispositionOut(DispositionIn):
+    alert_id: str
+    source: str  # "queue" or "below_the_line": which population the label came from
+    model_version: str  # the model whose decision the reviewer was looking at
+    decided_at: datetime
+
+
 class _State:
     def __init__(self):
         self.monitor = Monitor()
         self.history = History()
         self.triage = Triage.load(os.getenv("AMLWATCH_TRIAGE_MODEL", MODEL_PATH))
         self.decisions: dict[str, Decision] = {}
+        self.dispositions: dict[str, DispositionOut] = {}
 
     @property
     def txns(self) -> dict[str, Transaction]:
@@ -207,6 +221,44 @@ def narrative(alert_id: str, drafter: str = "template"):
     )
 
 
+@app.post("/alerts/{alert_id}/disposition", response_model=DispositionOut)
+def record_disposition(alert_id: str, body: DispositionIn):
+    """Record an investigator's outcome for an alert: the label future models are trained on.
+
+    Each label keeps which population it came from. Labels from the queue only describe
+    what triage already let through; labels from below-the-line review of suppressed
+    alerts are the only evidence about what it hides, so the two must never be mixed up.
+    """
+    a = _find(alert_id)
+    if a.alert_id in STATE.dispositions:
+        raise HTTPException(409, f"{alert_id} already has a disposition")
+    d = STATE.decisions[a.alert_id]
+    out = DispositionOut(
+        **body.model_dump(), alert_id=a.alert_id, source="queue" if d.queued else "below_the_line",
+        model_version=d.model_version, decided_at=datetime.now(timezone.utc),
+    )
+    STATE.dispositions[a.alert_id] = out
+    return out
+
+
+@app.get("/dispositions", response_model=list[DispositionOut])
+def dispositions(source: Optional[str] = None):  # noqa: UP045 - FastAPI evaluates this on 3.9
+    if source not in (None, "queue", "below_the_line"):
+        raise HTTPException(400, "source must be 'queue' or 'below_the_line'")
+    return [d for d in STATE.dispositions.values() if source in (None, d.source)]
+
+
+def _below_the_line(suppressed: int) -> dict:
+    reviewed = [d for d in STATE.dispositions.values() if d.source == "below_the_line"]
+    escalated = sum(d.outcome == "escalated" for d in reviewed)
+    return {
+        "reviewed": len(reviewed),
+        "escalated": escalated,
+        # the sample's hit rate scaled to everything suppressed: the only estimate of what triage misses
+        "estimated_missed": round(escalated / len(reviewed) * suppressed, 1) if reviewed else None,
+    }
+
+
 @app.get("/metrics")
 def metrics():
     by_typology = {t: {"alerts": 0, "queued": 0} for t in TYPOLOGIES}
@@ -217,5 +269,5 @@ def metrics():
     return {
         "transactions": len(STATE.txns), "alerts": len(STATE.monitor.alerts), "queued": queued,
         "suppressed": len(STATE.monitor.alerts) - queued, "triage_model": STATE.triage.version,
-        "alerts_by_typology": by_typology,
+        "alerts_by_typology": by_typology, "below_the_line": _below_the_line(len(STATE.monitor.alerts) - queued),
     }

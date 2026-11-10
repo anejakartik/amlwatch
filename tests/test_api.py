@@ -81,3 +81,35 @@ def test_out_of_order_transaction_leaves_no_trace(monkeypatch):
         assert c.post("/transactions", json=[_txn(2, 8, 100)]).status_code == 422
         assert "T0000002" not in api.STATE.txns
         assert c.post("/transactions", json=[_txn(2, 13, 100)]).status_code == 200
+
+
+def test_dispositions_record_their_source_and_feed_the_missed_estimate(monkeypatch):
+    monkeypatch.setenv("AMLWATCH_SEED_DEMO", "1")
+    with client() as c:
+        assert c.get("/metrics").json()["below_the_line"] == {"reviewed": 0, "escalated": 0, "estimated_missed": None}
+        queued = c.get("/queue?limit=1").json()[0]["alert_id"]
+        sample = [a["alert_id"] for a in c.get("/suppressed/sample?n=4&seed=1").json()]
+
+        d = c.post(f"/alerts/{queued}/disposition", json={"outcome": "escalated", "reviewer": "inv1"}).json()
+        assert d["source"] == "queue" and d["model_version"] == api.STATE.triage.version
+        for i, alert_id in enumerate(sample):  # one of four sampled alerts turns out to be real
+            outcome = "escalated" if i == 0 else "closed"
+            r = c.post(f"/alerts/{alert_id}/disposition", json={"outcome": outcome, "reviewer": "inv2"})
+            assert r.json()["source"] == "below_the_line"
+
+        m = c.get("/metrics").json()
+        assert m["below_the_line"] == {"reviewed": 4, "escalated": 1, "estimated_missed": round(m["suppressed"] / 4, 1)}
+        assert len(c.get("/dispositions?source=below_the_line").json()) == 4
+        assert len(c.get("/dispositions?source=queue").json()) == 1
+
+
+def test_disposition_rejects_bad_input_and_double_labels(monkeypatch):
+    monkeypatch.setenv("AMLWATCH_SEED_DEMO", "1")
+    with client() as c:
+        alert_id = c.get("/queue?limit=1").json()[0]["alert_id"]
+        assert c.post(f"/alerts/{alert_id}/disposition", json={"outcome": "maybe", "reviewer": "x"}).status_code == 422
+        assert c.post(f"/alerts/{alert_id}/disposition", json={"outcome": "closed", "reviewer": ""}).status_code == 422
+        assert c.post("/alerts/A99999-x/disposition", json={"outcome": "closed", "reviewer": "x"}).status_code == 404
+        assert c.post(f"/alerts/{alert_id}/disposition", json={"outcome": "closed", "reviewer": "x"}).status_code == 200
+        assert c.post(f"/alerts/{alert_id}/disposition", json={"outcome": "closed", "reviewer": "x"}).status_code == 409
+        assert c.get("/dispositions?source=nope").status_code == 400

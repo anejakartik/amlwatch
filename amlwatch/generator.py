@@ -95,6 +95,20 @@ def _pass_through(b: _Builder, account: str, days: int) -> None:
         b.add(b.at(start + delay_h / 24), account, f"DST{rng.randint(1, 999):03d}", "out", out_total / legs, "wire")
 
 
+def _disguised_pass_through(b: _Builder, account: str, days: int) -> None:
+    """Pass-through dressed up as a home purchase: one wire out to a title company, a day or so later.
+
+    Launderers adapt to whatever gets them through, and buying property is a well-known
+    way to move money. Once alerts shaped like home purchases are being suppressed, this
+    is the shape to use. Only the source of the funds differs, and the features don't see it.
+    """
+    rng = b.rng
+    start = rng.uniform(5, days - 4)
+    amount = rng.uniform(30000, 90000)
+    b.add(b.at(start), account, f"SRC{rng.randint(1, 999):03d}", "in", amount, "wire")
+    b.add(b.at(start + rng.uniform(0.6, 1.8)), account, "TITLE01", "out", amount * rng.uniform(0.92, 0.99), "wire")
+
+
 def _fan_in(b: _Builder, account: str, days: int) -> None:
     rng = b.rng
     start = rng.uniform(5, days - 5)
@@ -128,7 +142,14 @@ def _cash_business(b: _Builder, account: str, days: int) -> None:
         day += rng.uniform(1.5, 3.0)
 
 
-def generate(seed: int = 7, n_accounts: int = 400, days: int = 60, bad_rate: float = 0.06) -> Dataset:
+def generate(
+    seed: int = 7, n_accounts: int = 400, days: int = 60, bad_rate: float = 0.06, disguised: float = 0.0
+) -> Dataset:
+    """`disguised` is the share of pass-through cases dressed up as home purchases (0 = none).
+
+    With the default of 0 the generator makes exactly the same draws as before, so every
+    existing dataset and number is unchanged.
+    """
     rng = random.Random(seed)
     b = _Builder(rng)
     truth: dict[str, set[str]] = {}
@@ -142,7 +163,10 @@ def generate(seed: int = 7, n_accounts: int = 400, days: int = 60, bad_rate: flo
         roll = rng.random()
         if roll < bad_rate:
             typology = rng.choice(list(injectors))
-            injectors[typology](b, account, days)
+            if typology == PASS_THROUGH and disguised and rng.random() < disguised:
+                _disguised_pass_through(b, account, days)
+            else:
+                injectors[typology](b, account, days)
             truth[account] = {typology}
         elif roll < bad_rate + 0.06:
             kind = rng.choice(list(benign))

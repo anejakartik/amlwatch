@@ -165,6 +165,48 @@ it suppressed ("below-the-line" testing). `GET /suppressed/sample?n=&seed=` draw
 The sample size matters: on the demo seeds triage hid 250 alerts, one of them real, so a 10% sample has
 about a 1 in 10 chance of finding it. How much to sample is a risk decision, not an engineering one.
 
+## Retraining on investigator decisions (v0.4)
+
+In production the only labels are what investigators decide, and they only see what triage
+queued. A model retrained on those labels is learning from its own filter: a laundering pattern
+that starts scoring under the threshold never gets reviewed, never becomes a training example, and
+the next model hides it too.
+
+`python -m amlwatch.feedback` replays that loop. Launderers adapt to whatever gets through, so half
+of the pass-through cases are now dressed up as home purchases: one wire out to a title company, a
+day or so after the money arrives (`generate(disguised=0.5)`; the default of 0 leaves every earlier
+dataset unchanged). Each month the current model decides, investigators label what they see, and
+the model is retrained on everything labelled so far. After each month it's scored on the demo
+seeds, which hold 45 real pass-through cases.
+
+| | Pass-through cases caught (of 45) | Alerts queued |
+| --- | --- | --- |
+| Shipped model, never retrained | 24 | 140 |
+| Retrained on the queue only, after 6 months | 27 | 141 |
+| Retrained on the queue + a 10% sample of suppressed alerts, after 1 month | 43 | 190 |
+| Same, after 2 months | 45 | 195 |
+
+- **Retraining on the queue alone barely moves.** In month 1 triage hid 275 alerts, 23 of them
+  real. None were reviewed, so none were learned from, then or in any later month.
+- **The below-the-line sample is what finds them.** The month-1 sample reviewed 25 suppressed
+  alerts and found 2 real ones. Scaled up, that's an estimate of 22 hidden cases; the true number
+  was 23. Retraining on those two labels was enough to pull the threshold down over the whole
+  disguised pattern. The estimate is noisy at this size: in month 3 it said 8 when there were 3.
+- **Catching them costs investigator time.** The disguised cases look like home purchases, so the
+  model now queues more real home purchases too: 195 alerts instead of 140 for 141 real cases
+  (precision 0.86 → 0.72). Better features (where did the money come from?) are the real fix.
+- **The textbook correction did worse here.** Counting each sampled alert 10 times (1/sample rate)
+  is the standard way to un-bias a sampled training set, and it recovered more slowly: 38 of 45
+  after month 1, 45 only by month 4. It also counts the sampled *legitimate* alerts 10 times,
+  which pushes scores in that region down. With a threshold set to keep every real case, an
+  unbiased probability isn't the goal. Across three sampling seeds the unweighted version reached
+  42–44 of 45 after one month; the weighted one 34–38.
+
+The API records those labels. `POST /alerts/{id}/disposition` stores an investigator's outcome with
+the model version they were looking at and **which population it came from**: the queue, or
+below-the-line review of a suppressed alert. `/metrics` turns the below-the-line labels into an
+estimate of what triage is missing.
+
 ## The narrative contract
 
 A draft is `ready` only if `validate()` passes every sentence:
@@ -197,7 +239,9 @@ uvicorn amlwatch.api:app --port 8000   # seeds the synthetic dataset on startup
 | `GET /alerts/{id}` | Alert with its triage decision and evidence table |
 | `GET /suppressed/sample?n=&seed=` | Reproducible random sample of suppressed alerts, for below-the-line review |
 | `POST /alerts/{id}/narrative?drafter=template\|claude` | Draft and validate a SAR narrative |
-| `GET /metrics` | Transaction, alert, queued and suppressed counts, and the triage model version |
+| `POST /alerts/{id}/disposition` | Record an investigator's outcome (`escalated` or `closed`), tagged with its source: queue or below-the-line |
+| `GET /dispositions?source=queue\|below_the_line` | Recorded outcomes |
+| `GET /metrics` | Counts, the triage model version, and below-the-line results with an estimate of missed cases |
 
 `drafter=claude` uses the official `anthropic` SDK with `ANTHROPIC_API_KEY`. The model defaults to
 `claude-opus-5-5` (override with `AMLWATCH_MODEL`), and server-side refusal fallback is enabled.
@@ -216,12 +260,14 @@ citation, wrong amount, wrong date, right amount but wrong transaction), the Cla
 against a fake client, the API, and triage (features never read counterparty names, reach only counts
 other customers and only the past, the threshold keeps every real training case, a held-out run,
 live/offline feature parity, a planted look-ahead feature that parity must catch, decision replay,
-and the shipped model matching its training recipe).
+and the shipped model matching its training recipe), and the retraining loop (queue-only retraining
+never reviews what it hides; retraining with a below-the-line sample catches more).
 
 ## Roadmap
 
-- Investigator dispositions through the API, fed back as training labels (with care: they only exist
-  for alerts someone looked at).
+- Scheduled retraining from recorded dispositions, with the new model shadow-scored against the
+  current one before it's promoted.
+- Source-of-funds features, so a disguised pass-through stops looking like a home purchase.
 - Bounded state: the live history keeps every transaction; it only needs about 33 days per account.
 - Counterparty features beyond reach: registered-business flag, account age, linked accounts.
 - Kafka consumer in front of `Monitor.ingest` and durable alert storage (Postgres).

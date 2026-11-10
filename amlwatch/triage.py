@@ -109,24 +109,27 @@ class LogReg:
     mu: list[float] = field(default_factory=list)
     sd: list[float] = field(default_factory=list)
 
-    def fit(self, X: list[list[float]], y: list[int]) -> LogReg:
+    def fit(self, X: list[list[float]], y: list[int], weights: list[float] | None = None) -> LogReg:
+        """`weights` scale each example's pull on the fit (e.g. 1/sample-rate for sampled reviews)."""
         n, d = len(X), len(X[0])
-        self.mu = [sum(r[j] for r in X) / n for j in range(d)]
-        self.sd = [math.sqrt(sum((r[j] - self.mu[j]) ** 2 for r in X) / n) or 1.0 for j in range(d)]
+        wts = [1.0] * n if weights is None else list(weights)
+        W = sum(wts)
+        self.mu = [sum(w * r[j] for r, w in zip(X, wts)) / W for j in range(d)]
+        self.sd = [math.sqrt(sum(w * (r[j] - self.mu[j]) ** 2 for r, w in zip(X, wts)) / W) or 1.0 for j in range(d)]
         Z = [self._std(r) for r in X]
-        pos = sum(y)
+        pos = sum(w for w, yi in zip(wts, y) if yi)
         # classes are imbalanced; weight them equally so the boundary isn't pulled toward the majority
-        cw = {1: n / (2 * pos), 0: n / (2 * (n - pos))} if 0 < pos < n else {0: 1.0, 1: 1.0}
+        cw = {1: W / (2 * pos), 0: W / (2 * (W - pos))} if 0 < pos < W else {0: 1.0, 1: 1.0}
         self.w, self.b = [0.0] * d, 0.0
         for _ in range(self.epochs):
             gw, gb = [0.0] * d, 0.0
-            for z, yi in zip(Z, y):
-                err = (_sigmoid(sum(wj * zj for wj, zj in zip(self.w, z)) + self.b) - yi) * cw[yi]
+            for z, yi, wi in zip(Z, y, wts):
+                err = (_sigmoid(sum(wj * zj for wj, zj in zip(self.w, z)) + self.b) - yi) * cw[yi] * wi
                 gb += err
                 for j in range(d):
                     gw[j] += err * z[j]
-            self.w = [wj - self.lr * (g / n + self.l2 * wj) for wj, g in zip(self.w, gw)]
-            self.b -= self.lr * gb / n
+            self.w = [wj - self.lr * (g / W + self.l2 * wj) for wj, g in zip(self.w, gw)]
+            self.b -= self.lr * gb / W
         return self
 
     def predict(self, x: list[float]) -> float:
@@ -192,14 +195,15 @@ class Triage:
         self.base: dict[str, float] = {}  # lowest score among real training cases
         self.margin = 0.0  # thresholds sit this fraction below `base`
 
-    def fit(self, examples: list[Example]) -> Triage:
+    def fit(self, examples: list[Example], weights: list[float] | None = None) -> Triage:
+        wts = [1.0] * len(examples) if weights is None else weights
         for typ in TYPOLOGIES:
-            rows = [(features(a, h), int(real)) for a, h, real in examples if a.typology == typ]
-            if not rows or not any(y for _, y in rows):
+            rows = [(features(a, h), int(real), w) for (a, h, real), w in zip(examples, wts) if a.typology == typ]
+            if not rows or not any(y for _, y, _ in rows):
                 continue
-            model = LogReg().fit([x for x, _ in rows], [y for _, y in rows])
+            model = LogReg().fit([x for x, _, _ in rows], [y for _, y, _ in rows], [w for _, _, w in rows])
             self.models[typ] = model
-            self.base[typ] = min(model.predict(x) for x, y in rows if y) * 0.999
+            self.base[typ] = min(model.predict(x) for x, y, _ in rows if y) * 0.999
         return self
 
     def calibrate(self, examples: list[Example]) -> Triage:
